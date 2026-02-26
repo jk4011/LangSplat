@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -44,7 +45,7 @@ if __name__ == '__main__':
         batch_size=64,
         shuffle=True,
         num_workers=16,
-        drop_last=False
+        drop_last=True
     )
 
     test_loader = DataLoader(
@@ -66,20 +67,29 @@ if __name__ == '__main__':
 
     best_eval_loss = 100.0
     best_epoch = 0
+    inference_times = []
     for epoch in tqdm(range(num_epochs)):
         model.train()
         for idx, feature in enumerate(train_loader):
             data = feature.to("cuda:0")
+
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
             outputs_dim3 = model.encode(data)
             outputs = model.decode(outputs_dim3)
-            
-            l2loss = l2_loss(outputs, data) 
+
+            l2loss = l2_loss(outputs, data)
             cosloss = cos_loss(outputs, data)
             loss = l2loss + cosloss * 0.001
-            
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            torch.cuda.synchronize()
+            if epoch > 0 or idx > 0:  # skip warmup
+                inference_times.append(time.perf_counter() - _t0)
 
             global_iter = epoch * len(train_loader) + idx
             tb_writer.add_scalar('train_loss/l2_loss', l2loss.item(), global_iter)
@@ -108,3 +118,13 @@ if __name__ == '__main__':
             
     print(f"best_epoch: {best_epoch}")
     print("best_loss: {:.8f}".format(best_eval_loss))
+
+    if len(inference_times) > 0:
+        total_infer = sum(inference_times)
+        n = len(inference_times)
+        print(f"\n===== Autoencoder Training Timing (excluding warmup & data load) =====")
+        print(f"Iterations measured: {n}")
+        print(f"Forward+Backward total : {total_infer:.3f}s")
+        print(f"Forward+Backward per iter: {total_infer/n*1000:.3f}ms")
+        print(f"======================================================================")
+        print(f"\nTIMING_RESULT: AE_TRAIN_TIME={total_infer:.2f}")

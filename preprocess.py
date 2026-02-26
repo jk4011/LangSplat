@@ -1,6 +1,8 @@
 import os
 import random
 import argparse
+import gc
+import time
 
 import numpy as np
 import torch
@@ -116,16 +118,19 @@ def create(image_list, data_list, save_folder):
     seg_maps = []
     total_lengths = []
     timer = 0
+    total_sam_time = 0.0
+    total_clip_time = 0.0
     img_embeds = torch.zeros((len(image_list), 300, embed_size))
-    seg_maps = torch.zeros((len(image_list), 4, *image_list[0].shape[1:])) 
+    seg_maps = torch.zeros((len(image_list), 4, *image_list[0].shape[1:]))
     mask_generator.predictor.model.to('cuda')
 
     for i, img in tqdm(enumerate(image_list), desc="Embedding images", leave=False):
         timer += 1
-        try:
-            img_embed, seg_map = _embed_clip_sam_tiles(img.unsqueeze(0), sam_encoder)
-        except:
-            raise ValueError(timer)
+        img_embed, seg_map, sam_time, clip_time = _embed_clip_sam_tiles(img.unsqueeze(0), sam_encoder)
+        # Skip first image for warmup
+        if i > 0:
+            total_sam_time += sam_time
+            total_clip_time += clip_time
 
         lengths = [len(v) for k, v in img_embed.items()]
         total_length = sum(lengths)
@@ -156,8 +161,16 @@ def create(image_list, data_list, save_folder):
         seg_map = torch.stack(seg_map_tensor, dim=0)
         seg_maps[i] = seg_map
 
+        # Free GPU memory between images to prevent heap corruption
+        if i % 10 == 0:
+            torch.cuda.empty_cache()
+            gc.collect()
+
     mask_generator.predictor.model.to('cpu')
-        
+
+    # Print timing results (excluding first image warmup)
+    print(f"\nTIMING_RESULT: SAM_TIME={total_sam_time:.2f} CLIP_TIME={total_clip_time:.2f}")
+
     for i in range(img_embeds.shape[0]):
         save_path = os.path.join(save_folder, data_list[i].split('.')[0])
         assert total_lengths[i] == int(seg_maps[i].max() + 1)
@@ -175,8 +188,17 @@ def sava_numpy(save_path, data):
 
 def _embed_clip_sam_tiles(image, sam_encoder):
     aug_imgs = torch.cat([image])
-    seg_images, seg_map = sam_encoder(aug_imgs)
 
+    # Time SAM extraction
+    torch.cuda.synchronize()
+    sam_t0 = time.perf_counter()
+    seg_images, seg_map = sam_encoder(aug_imgs)
+    torch.cuda.synchronize()
+    sam_time = time.perf_counter() - sam_t0
+
+    # Time CLIP encoding
+    torch.cuda.synchronize()
+    clip_t0 = time.perf_counter()
     clip_embeds = {}
     for mode in ['default', 's', 'm', 'l']:
         tiles = seg_images[mode]
@@ -185,8 +207,10 @@ def _embed_clip_sam_tiles(image, sam_encoder):
             clip_embed = model.encode_image(tiles)
         clip_embed /= clip_embed.norm(dim=-1, keepdim=True)
         clip_embeds[mode] = clip_embed.detach().cpu().half()
-    
-    return clip_embeds, seg_map
+    torch.cuda.synchronize()
+    clip_time = time.perf_counter() - clip_t0
+
+    return clip_embeds, seg_map, sam_time, clip_time
 
 def get_seg_img(mask, image):
     image = image.copy()
@@ -215,52 +239,51 @@ def filter(keep: torch.Tensor, masks_result) -> None:
 def mask_nms(masks, scores, iou_thr=0.7, score_thr=0.1, inner_thr=0.2, **kwargs):
     """
     Perform mask non-maximum suppression (NMS) on a set of masks based on their scores.
-    
-    Args:
-        masks (torch.Tensor): has shape (num_masks, H, W)
-        scores (torch.Tensor): The scores of the masks, has shape (num_masks,)
-        iou_thr (float, optional): The threshold for IoU.
-        score_thr (float, optional): The threshold for the mask scores.
-        inner_thr (float, optional): The threshold for the overlap rate.
-        **kwargs: Additional keyword arguments.
-    Returns:
-        selected_idx (torch.Tensor): A tensor representing the selected indices of the masks after NMS.
+    Vectorized implementation - no Python for loops over mask pairs.
     """
 
     scores, idx = scores.sort(0, descending=True)
     num_masks = idx.shape[0]
-    
+
     masks_ord = masks[idx.view(-1), :]
     masks_area = torch.sum(masks_ord, dim=(1, 2), dtype=torch.float)
 
-    iou_matrix = torch.zeros((num_masks,) * 2, dtype=torch.float, device=masks.device)
-    inner_iou_matrix = torch.zeros((num_masks,) * 2, dtype=torch.float, device=masks.device)
-    for i in range(num_masks):
-        for j in range(i, num_masks):
-            intersection = torch.sum(torch.logical_and(masks_ord[i], masks_ord[j]), dtype=torch.float)
-            union = torch.sum(torch.logical_or(masks_ord[i], masks_ord[j]), dtype=torch.float)
-            iou = intersection / union
-            iou_matrix[i, j] = iou
-            # select mask pairs that may have a severe internal relationship
-            if intersection / masks_area[i] < 0.5 and intersection / masks_area[j] >= 0.85:
-                inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
-                inner_iou_matrix[i, j] = inner_iou
-            if intersection / masks_area[i] >= 0.85 and intersection / masks_area[j] < 0.5:
-                inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
-                inner_iou_matrix[j, i] = inner_iou
+    # Vectorized pairwise intersection: flatten masks to (N, H*W), matrix multiply
+    masks_flat = masks_ord.reshape(num_masks, -1).float()
+    intersection_matrix = torch.mm(masks_flat, masks_flat.t())  # (N, N)
+
+    # Union = area_i + area_j - intersection
+    union_matrix = masks_area.unsqueeze(1) + masks_area.unsqueeze(0) - intersection_matrix
+    iou_matrix = intersection_matrix / (union_matrix + 1e-8)
+
+    # Inner IoU: overlap rate relative to each mask's area
+    # ratio_ij = intersection / area_i, ratio_ji = intersection / area_j
+    ratio_i = intersection_matrix / (masks_area.unsqueeze(1) + 1e-8)  # (N, N) - ratio w.r.t. row mask
+    ratio_j = intersection_matrix / (masks_area.unsqueeze(0) + 1e-8)  # (N, N) - ratio w.r.t. col mask
+
+    # inner_iou for upper triangle: row has small overlap, col has large overlap
+    cond_upper = (ratio_i < 0.5) & (ratio_j >= 0.85)
+    inner_iou_upper = 1 - ratio_j * ratio_i
+    inner_iou_matrix = torch.where(cond_upper, inner_iou_upper, torch.zeros_like(inner_iou_upper))
+
+    # inner_iou for lower triangle: col has small overlap, row has large overlap
+    cond_lower = (ratio_i >= 0.85) & (ratio_j < 0.5)
+    inner_iou_lower = 1 - ratio_j * ratio_i
+    inner_iou_matrix_t = torch.where(cond_lower, inner_iou_lower, torch.zeros_like(inner_iou_lower))
 
     iou_matrix.triu_(diagonal=1)
     iou_max, _ = iou_matrix.max(dim=0)
     inner_iou_matrix_u = torch.triu(inner_iou_matrix, diagonal=1)
     inner_iou_max_u, _ = inner_iou_matrix_u.max(dim=0)
-    inner_iou_matrix_l = torch.tril(inner_iou_matrix, diagonal=1)
+    # For lower triangle: the original code writes to inner_iou_matrix[j, i] (transposed)
+    inner_iou_matrix_l = torch.tril(inner_iou_matrix_t.t(), diagonal=-1)
     inner_iou_max_l, _ = inner_iou_matrix_l.max(dim=0)
-    
+
     keep = iou_max <= iou_thr
     keep_conf = scores > score_thr
     keep_inner_u = inner_iou_max_u <= 1 - inner_thr
     keep_inner_l = inner_iou_max_l <= 1 - inner_thr
-    
+
     # If there are no masks with scores above threshold, the top 3 masks are selected
     if keep_conf.sum() == 0:
         index = scores.topk(3).indices
@@ -402,3 +425,4 @@ if __name__ == '__main__':
     save_folder = os.path.join(dataset_path, 'language_features')
     os.makedirs(save_folder, exist_ok=True)
     create(imgs, data_list, save_folder)
+    print("Preprocessing done.")

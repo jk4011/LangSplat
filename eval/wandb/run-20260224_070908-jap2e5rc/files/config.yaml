@@ -1,0 +1,104 @@
+_wandb:
+    value:
+        cli_version: 0.24.2
+        e:
+            6h4nfrhdh3njpxd1atvnunj8u0rbz2nl:
+                args:
+                    - --dataset_name
+                    - figurines
+                    - --feat_dir
+                    - ../output_experiment/lerf
+                    - --ae_ckpt_dir
+                    - ../autoencoder/ckpt
+                    - --output_dir
+                    - ../eval_output_experiment/lerf
+                    - --json_folder
+                    - ../dataset/lerf_ovs/label
+                    - --mask_thresh
+                    - "0.4"
+                    - --wandb
+                codePath: eval/evaluate_iou_loc.py
+                codePathLocal: evaluate_iou_loc.py
+                cpu_count: 32
+                cpu_count_logical: 63
+                cudaVersion: "12.0"
+                disk:
+                    /:
+                        total: "527295578112"
+                        used: "521582129152"
+                email: jinhyuk@unist.ac.kr
+                executable: /opt/conda/envs/langsplat/bin/python
+                git:
+                    commit: d70edb86df0fcbda19dc0d9739a3e5140a5e65fc
+                    remote: https://github.com/minghanqin/LangSplat.git
+                gpu: NVIDIA RTX 6000 Ada Generation
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-78507566-e064-db3a-ac92-f7f09c263761
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-3d07fb71-b64d-b785-6be1-ca1003f5d8b5
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-cf64e343-f8bd-e840-6f55-f4f6be47806e
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-3b97e90a-e663-bab9-cfaa-a744d80239c3
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-f15681a0-3020-2096-6360-121511bf8f12
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-aa0cb50d-af72-6c0b-b27e-96afdaa214cf
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-2519cdc5-33b9-c826-11c8-5880509b7e40
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-a1043c35-adac-8400-8a48-4eab3ceaaab4
+                host: cgmark14
+                memory:
+                    total: "540780593152"
+                os: Linux-5.4.0-172-generic-x86_64-with-glibc2.17
+                program: evaluate_iou_loc.py
+                python: CPython 3.8.20
+                root: /root/data1/jinhyeok/LangSplat/eval
+                startedAt: "2026-02-24T07:09:08.598082Z"
+                writerId: 6h4nfrhdh3njpxd1atvnunj8u0rbz2nl
+        m: []
+        python_version: 3.8.20
+        t:
+            "1":
+                - 1
+                - 41
+                - 49
+                - 63
+            "2":
+                - 1
+                - 41
+                - 49
+                - 63
+            "3":
+                - 13
+            "4": 3.8.20
+            "5": 0.24.2
+            "12": 0.24.2
+            "13": linux-x86_64

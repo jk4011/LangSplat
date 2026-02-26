@@ -10,6 +10,7 @@
 #
 
 import os
+import time
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -55,9 +56,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+    total_train_time_ms = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -73,8 +75,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             except Exception as e:
                 network_gui.conn = None
 
-        iter_start.record()
-
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -85,24 +85,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-        
+
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
+
+        # Start timing AFTER data loading (camera sampling, feature loading)
+        iter_start.record()
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt)
         image, language_feature, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["language_feature_image"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        
+
         # Loss
         if opt.include_feature:
             gt_language_feature, language_feature_mask = viewpoint_cam.get_language_feature(language_feature_dir=dataset.lf_path, feature_level=dataset.feature_level)
-            Ll1 = l1_loss(language_feature*language_feature_mask, gt_language_feature*language_feature_mask)            
+            Ll1 = l1_loss(language_feature*language_feature_mask, gt_language_feature*language_feature_mask)
             loss = Ll1
         else:
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss.backward()
+
         iter_end.record()
+
+        # Accumulate training time (skip first iteration for warmup)
+        if iteration > 1:
+            torch.cuda.synchronize()
+            total_train_time_ms += iter_start.elapsed_time(iter_end)
+
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -140,7 +151,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(opt.include_feature), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-            
+
+    # Print timing result
+    total_train_time_s = total_train_time_ms / 1000.0
+    if opt.include_feature:
+        print(f"\nTIMING_RESULT: LIFTING_TRAIN_TIME={total_train_time_s:.2f}")
+    else:
+        print(f"\nTIMING_RESULT: RECONSTRUCTION_TIME={total_train_time_s:.2f}")
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):

@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import torch
 import argparse
@@ -59,18 +60,27 @@ if __name__ == '__main__':
     model.load_state_dict(checkpoint)
     model.eval()
 
+    inference_times = []
     for idx, feature in tqdm(enumerate(test_loader)):
         data = feature.to("cuda:0")
         with torch.no_grad():
-            outputs = model.encode(data).to("cpu").numpy()  
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+            outputs = model.encode(data).to("cpu").numpy()
+            torch.cuda.synchronize()
+            if idx > 0:  # skip first batch for warmup
+                inference_times.append(time.perf_counter() - _t0)
         if idx == 0:
             features = outputs
         else:
             features = np.concatenate([features, outputs], axis=0)
 
+    total_ae_test_time = sum(inference_times) if inference_times else 0.0
+    print(f"\nTIMING_RESULT: AE_TEST_TIME={total_ae_test_time:.2f}")
+
     os.makedirs(output_dir, exist_ok=True)
     start = 0
-    
+
     for k,v in train_dataset.data_dic.items():
         path = os.path.join(output_dir, k)
         np.save(path, features[start:start+v])

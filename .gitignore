@@ -10,3 +10,9 @@ tensorboard_3d
 events.out*
 ckpt
 release
+ckpts*
+eval*
+wandb/
+log/
+dataset/
+output*

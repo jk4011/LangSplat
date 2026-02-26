@@ -16,12 +16,24 @@ import torch
 import time
 from tqdm import tqdm
 
+import torch.nn.functional as F
+import wandb
+
 import sys
 sys.path.append("..")
 import colormaps
 from autoencoder.model import Autoencoder
 from openclip_encoder import OpenCLIPNetwork
 from utils import smooth, colormap_saving, vis_mask_save, polygon_to_mask, stack_mask, show_result
+
+
+def show_image_with_mask(target_img, mask, opacity=0.2):
+    """Overlay mask on RGB image as RGBA. target_img: (3,H,W), mask: (H,W) or (1,H,W)."""
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    if target_img.shape[-2:] != mask.shape[-2:]:
+        mask = F.interpolate(mask[None], size=target_img.shape[-2:], mode='nearest')[0]
+    return torch.cat([target_img, (mask + opacity) / (1 + opacity)], dim=0)
 
 
 def get_logger(name, log_file=None, log_level=logging.INFO, file_mode='w'):
@@ -68,7 +80,17 @@ def eval_gt_lerfdata(json_folder: Union[str, Path] = None, ouput_path: Path = No
         idx = int(gt_data['info']['name'].split('_')[-1].split('.jpg')[0]) - 1 
         for prompt_data in gt_data["objects"]:
             label = prompt_data['category']
-            box = np.asarray(prompt_data['bbox']).reshape(-1)           # x1y1x2y2
+            if 'bbox' in prompt_data:
+                box = np.asarray(prompt_data['bbox']).reshape(-1)       # x1y1x2y2
+            else:
+                # Compute bbox from segmentation polygon
+                all_pts = []
+                for poly in prompt_data['segmentation']:
+                    all_pts.extend(poly)
+                pts = np.array(all_pts)
+                x1, y1 = pts[:, 0].min(), pts[:, 1].min()
+                x2, y2 = pts[:, 0].max(), pts[:, 1].max()
+                box = np.array([x1, y1, x2, y2])
             mask = polygon_to_mask((h, w), prompt_data['segmentation'])
             if img_ann[label].get('mask', None) is not None:
                 mask = stack_mask(img_ann[label]['mask'], mask)
@@ -87,13 +109,14 @@ def eval_gt_lerfdata(json_folder: Union[str, Path] = None, ouput_path: Path = No
     return gt_ann, (h, w), img_paths
 
 
-def activate_stream(sem_map, 
-                    image, 
-                    clip_model, 
+def activate_stream(sem_map,
+                    image,
+                    clip_model,
                     image_name: Path = None,
-                    img_ann: Dict = None, 
-                    thresh : float = 0.5, 
-                    colormap_options = None):
+                    img_ann: Dict = None,
+                    thresh : float = 0.5,
+                    colormap_options = None,
+                    wandb_images = None):
     valid_map = clip_model.get_max_across(sem_map)                 # 3xkx832x1264
     n_head, n_prompt, h, w = valid_map.shape
 
@@ -151,10 +174,32 @@ def activate_stream(sem_map,
         
         chosen_iou_list.append(iou_lvl[chosen_lvl])
         chosen_lvl_list.append(chosen_lvl.cpu().numpy())
-        
+
         # save for visulsization
         save_path = image_name / f'chosen_{clip_model.positives[k]}.png'
         vis_mask_save(mask_lvl[chosen_lvl], save_path)
+
+        # wandb logging
+        if wandb_images is not None:
+            prompt = clip_model.positives[k]
+            chosen_mask_pred = mask_lvl[chosen_lvl]
+            mask_gt = img_ann[prompt]['mask'].astype(np.uint8)
+            iou_val = iou_lvl[chosen_lvl]
+            img_h, img_w = image.shape[0], image.shape[1]
+            half_h, half_w = img_h // 2, img_w // 2
+            img_chw = image.permute(2, 0, 1).cpu()
+            img_half = F.interpolate(img_chw[None], size=(half_h, half_w), mode='bilinear', align_corners=False)[0]
+            mask_gt_half = F.interpolate(
+                torch.from_numpy(mask_gt.astype(np.float32))[None, None], size=(half_h, half_w), mode='nearest'
+            )[0, 0]
+            mask_pred_half = F.interpolate(
+                torch.from_numpy(chosen_mask_pred.astype(np.float32))[None, None], size=(half_h, half_w), mode='nearest'
+            )[0, 0]
+            gt_overlay = show_image_with_mask(img_half, mask_gt_half)
+            pred_overlay = show_image_with_mask(img_half, mask_pred_half)
+            key = f"frame_{image_name.name}/{prompt}"
+            wandb_images[f"gt/{key}"] = wandb.Image(gt_overlay.permute(1, 2, 0).numpy(), caption=f"GT | IoU: {iou_val:.3f}")
+            wandb_images[f"pred/{key}"] = wandb.Image(pred_overlay.permute(1, 2, 0).numpy(), caption=f"Pred | IoU: {iou_val:.3f}")
 
     return chosen_iou_list, chosen_lvl_list
 
@@ -175,8 +220,8 @@ def lerf_localization(sem_map, image, clip_model, image_name, img_ann):
         # NOTE 平滑后的激活值图中找最大值点
         scale = 30
         kernel = np.ones((scale,scale)) / (scale**2)
-        np_relev = select_output.cpu().numpy()
-        avg_filtered = cv2.filter2D(np_relev.transpose(1,2,0), -1, kernel)
+        np_relev = select_output.cpu().numpy().astype(np.float32)
+        avg_filtered = cv2.filter2D(np_relev.transpose(1,2,0), -1, kernel.astype(np.float32))
         
         score_lvl = np.zeros((n_head,))
         coord_lvl = []
@@ -217,7 +262,7 @@ def lerf_localization(sem_map, image, clip_model, image_name, img_ann):
     return acc_num
 
 
-def evaluate(feat_dir, output_path, ae_ckpt_path, json_folder, mask_thresh, encoder_hidden_dims, decoder_hidden_dims, logger):
+def evaluate(feat_dir, output_path, ae_ckpt_path, json_folder, mask_thresh, encoder_hidden_dims, decoder_hidden_dims, logger, wandb_images=None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     colormap_options = colormaps.ColormapOptions(
@@ -257,14 +302,29 @@ def evaluate(feat_dir, output_path, ae_ckpt_path, json_folder, mask_thresh, enco
 
         with torch.no_grad():
             lvl, h, w, _ = sem_feat.shape
-            restored_feat = model.decode(sem_feat.flatten(0, 2))
-            restored_feat = restored_feat.view(lvl, h, w, -1)           # 3x832x1264x512
+            # Decode level by level with half precision to avoid OOM on high-res images
+            restored_levels = []
+            batch_size = 128 * 1024  # 128K elements per batch
+            for li in range(lvl):
+                level_feat = sem_feat[li].flatten(0, 1)  # (h*w, 3)
+                if level_feat.shape[0] > batch_size:
+                    decoded_parts = []
+                    for bi in range(0, level_feat.shape[0], batch_size):
+                        part = model.decode(level_feat[bi:bi+batch_size]).half()
+                        decoded_parts.append(part)
+                    level_decoded = torch.cat(decoded_parts, dim=0)
+                else:
+                    level_decoded = model.decode(level_feat).half()
+                restored_levels.append(level_decoded.view(h, w, -1))
+                torch.cuda.empty_cache()
+            restored_feat = torch.stack(restored_levels, dim=0)  # 3xHxWx512 in half precision
         
         img_ann = gt_ann[f'{idx}']
         clip_model.set_positives(list(img_ann.keys()))
         
         c_iou_list, c_lvl = activate_stream(restored_feat, rgb_img, clip_model, image_name, img_ann,
-                                            thresh=mask_thresh, colormap_options=colormap_options)
+                                            thresh=mask_thresh, colormap_options=colormap_options,
+                                            wandb_images=wandb_images)
         chosen_iou_all.extend(c_iou_list)
         chosen_lvl_list.extend(c_lvl)
 
@@ -283,6 +343,8 @@ def evaluate(feat_dir, output_path, ae_ckpt_path, json_folder, mask_thresh, enco
         total_bboxes += len(list(img_ann.keys()))
     acc = acc_num / total_bboxes
     logger.info("Localization accuracy: " + f'{acc:.4f}')
+
+    return mean_iou_chosen, acc
 
 
 def seed_everything(seed_value):
@@ -319,6 +381,8 @@ if __name__ == "__main__":
                         type=int,
                         default=[16, 32, 64, 128, 256, 256, 512],
                         )
+    parser.add_argument('--wandb', action='store_true')
+    parser.add_argument('--wandb_project', type=str, default='lerf')
     args = parser.parse_args()
 
     # NOTE config setting
@@ -335,4 +399,16 @@ if __name__ == "__main__":
     log_file = os.path.join(output_path, f'{timestamp}.log')
     logger = get_logger(f'{dataset_name}', log_file=log_file, log_level=logging.INFO)
 
-    evaluate(feat_dir, output_path, ae_ckpt_path, json_folder, mask_thresh, args.encoder_dims, args.decoder_dims, logger)
+    wandb_images = None
+    if args.wandb:
+        wandb.init(project=args.wandb_project,
+                   group="langsplat", name=f"[langsplat] {dataset_name}")
+        wandb_images = {}
+
+    mean_iou, acc = evaluate(feat_dir, output_path, ae_ckpt_path, json_folder, mask_thresh, args.encoder_dims, args.decoder_dims, logger, wandb_images=wandb_images)
+
+    if args.wandb and wandb_images:
+        log_dict = {"mIoU": mean_iou, "loc_acc": acc}
+        log_dict.update(wandb_images)
+        wandb.log(log_dict)
+        wandb.finish()
